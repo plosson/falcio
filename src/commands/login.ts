@@ -1,8 +1,56 @@
 import { login, getUserMe } from "../lib/api.ts";
-import { saveSession, type Session } from "../lib/store.ts";
+import { saveAccount, saveProfile, listProfiles, loadProfile } from "../lib/store.ts";
+import { isValidProfileName, requestedProfile, slugify } from "../lib/profile.ts";
 import { prompt, promptHidden, promptChoice } from "../lib/prompt.ts";
 
-export async function runLogin(_args: string[]): Promise<number> {
+const HELP = `falcio login — authenticate and store a profile
+
+Usage:
+  falcio login [--profile <name>]
+
+A profile is one account on one organization. Log in again to add a second
+organization, or a second account, as its own profile.
+
+Options:
+  --profile <name>  Name the profile instead of being prompted.
+  -h, --help        Show this help.
+`;
+
+/** Ask for a profile name, defaulting to the org slug and rejecting bad input. */
+async function promptProfileName(suggested: string, taken: string[]): Promise<string> {
+  while (true) {
+    const answer = (await prompt(`Profile name [${suggested}]: `)).trim();
+    const name = answer || suggested;
+    if (!isValidProfileName(name)) {
+      console.error("  Use lowercase letters, digits, dot, dash or underscore (max 64).");
+      continue;
+    }
+    if (taken.includes(name)) {
+      const ok = (await prompt(`  Profile "${name}" exists. Overwrite? [y/N] `)).trim().toLowerCase();
+      if (ok !== "y" && ok !== "yes") continue;
+    }
+    return name;
+  }
+}
+
+export async function runLogin(args: string[]): Promise<number> {
+  for (const arg of args) {
+    if (arg === "-h" || arg === "--help") {
+      console.log(HELP);
+      return 0;
+    }
+    console.error(`Unknown option: ${arg}\n`);
+    console.log(HELP);
+    return 1;
+  }
+
+  // --profile is stripped globally, so read the requested name from there.
+  const preset = requestedProfile();
+  if (preset && !isValidProfileName(preset)) {
+    console.error(`Invalid profile name: ${preset}`);
+    return 1;
+  }
+
   const email = (await prompt("Email: ")).trim();
   if (!email) {
     console.error("Aborted: email is required.");
@@ -48,24 +96,48 @@ export async function runLogin(_args: string[]): Promise<number> {
     return 1;
   }
 
+  const existing = await listProfiles();
   const chosen = await promptChoice(
     `\nAvailable organizations (${organizations.length}):`,
     organizations,
     (o) => `${o.name}${o.vatNumber ? ` — ${o.vatNumber}` : ""} (${o.id})`,
   );
 
+  // Reuse the profile already pointing at this account/org pair, so logging in
+  // again to renew a token does not quietly leave a duplicate behind.
+  let name = preset;
+  if (!name) {
+    for (const candidate of existing) {
+      const p = await loadProfile(candidate);
+      if (p?.account_id === id && p.organization_id === chosen.id) {
+        name = candidate;
+        break;
+      }
+    }
+  }
+  if (!name) {
+    name = await promptProfileName(slugify(chosen.name), existing);
+  }
+
   const now = Date.now();
-  const session: Session = {
+  await saveAccount({
     refresh_token: result.refresh_token,
     refresh_expires_at: now + result.refresh_token_expires_in * 1000,
-    organization_id: chosen.id,
     user: { id, email: emailOut, firstName, lastName },
-  };
-  await saveSession(session);
+  });
+  await saveProfile(name, {
+    account_id: id,
+    organization_id: chosen.id,
+    organization_name: chosen.name,
+  });
 
-  const expiresOn = new Date(session.refresh_expires_at).toISOString().slice(0, 10);
+  const expiresOn = new Date(now + result.refresh_token_expires_in * 1000).toISOString().slice(0, 10);
   console.log(`\nLogged in as ${firstName} ${lastName} <${emailOut}>.`);
+  console.log(`Profile:    ${name}`);
   console.log(`Active org: ${chosen.name} (${chosen.id})`);
   console.log(`Session valid until ${expiresOn} (auto-renewed on each use).`);
+  if (existing.length > 0 && !existing.includes(name)) {
+    console.log(`\nYou now have several profiles. Pass --profile ${name} to use this one.`);
+  }
   return 0;
 }
