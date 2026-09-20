@@ -5,6 +5,7 @@ import { prompt } from "../lib/prompt.ts";
 import { getVersion } from "../lib/version.ts";
 
 const GITHUB_REPO = "plosson/falcio";
+const USER_AGENT = "falcio-updater";
 
 const HELP = `falcio update — update falcio to the latest release
 
@@ -38,18 +39,96 @@ function isCompiledBinary(): boolean {
   return process.argv[0] === "bun" && !/[\\/]bun(\.exe)?$/.test(process.execPath);
 }
 
+interface LatestRelease {
+  tag: string;
+  // Populated only when the REST API answered; the redirect path knows the tag
+  // but not the asset list.
+  assets: GitHubRelease["assets"] | null;
+}
+
+function githubAuthHeaders(): Record<string, string> {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+// github.com/<repo>/releases/latest redirects to /releases/tag/<tag>. This is not
+// the REST API, so it does not consume the 60 requests/hour that api.github.com
+// allows an unauthenticated IP - a budget other tools on the same machine (or
+// behind the same NAT) can exhaust on their own.
+async function fetchLatestTagViaRedirect(): Promise<string | null> {
+  try {
+    const res = await fetch(`https://github.com/${GITHUB_REPO}/releases/latest`, {
+      method: "HEAD",
+      redirect: "manual",
+      headers: { "User-Agent": USER_AGENT },
+    });
+    const location = res.headers.get("location");
+    const match = location?.match(/\/releases\/tag\/([^/?#]+)$/);
+    return match ? decodeURIComponent(match[1]!) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchLatestRelease(): Promise<GitHubRelease> {
   const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, {
     headers: {
       Accept: "application/vnd.github.v3+json",
-      "User-Agent": "falcio-updater",
+      "User-Agent": USER_AGENT,
+      ...githubAuthHeaders(),
     },
   });
   if (!res.ok) {
     if (res.status === 404) throw new Error("No releases found");
+    if (res.headers.get("x-ratelimit-remaining") === "0") {
+      const reset = Number(res.headers.get("x-ratelimit-reset") || 0);
+      const minutes = reset ? Math.max(1, Math.ceil((reset * 1000 - Date.now()) / 60000)) : 0;
+      throw new Error(
+        `GitHub API rate limit exceeded${minutes ? ` (resets in ~${minutes} min)` : ""}. ` +
+          "Set GITHUB_TOKEN (or GH_TOKEN) to raise the limit, or install manually with: " +
+          "curl -LsSf https://falcio.houlahop.com/install | sh",
+      );
+    }
     throw new Error(`Failed to fetch release info: ${res.statusText}`);
   }
   return res.json() as Promise<GitHubRelease>;
+}
+
+// Prefer the redirect; fall back to the REST API so a GitHub change to the
+// redirect shape degrades to the old behaviour rather than breaking updates.
+async function resolveLatestRelease(): Promise<LatestRelease> {
+  const tag = await fetchLatestTagViaRedirect();
+  if (tag) return { tag, assets: null };
+
+  const release = await fetchLatestRelease();
+  return { tag: release.tag_name, assets: release.assets };
+}
+
+// The redirect path never sees the asset list, so the download URL is built from
+// the tag and probed with a HEAD to keep the "no binary for this platform" error.
+async function resolveDownloadUrl(
+  release: LatestRelease,
+  assetName: string,
+  platform: string,
+): Promise<string | null> {
+  if (release.assets) {
+    const asset = release.assets.find((a) => a.name === assetName);
+    if (!asset) {
+      console.error(`No binary found for ${platform}.`);
+      console.error(`Available assets: ${release.assets.map((a) => a.name).join(", ")}`);
+      return null;
+    }
+    return asset.browser_download_url;
+  }
+
+  const url = `https://github.com/${GITHUB_REPO}/releases/download/${release.tag}/${assetName}`;
+  const res = await fetch(url, { method: "HEAD", headers: { "User-Agent": USER_AGENT } });
+  if (!res.ok) {
+    console.error(`No binary found for ${platform} in release ${release.tag}.`);
+    console.error(`Expected asset: ${assetName}`);
+    return null;
+  }
+  return url;
 }
 
 function compareVersions(current: string, latest: string): number {
@@ -84,7 +163,7 @@ async function writeChunk(stream: fs.WriteStream, chunk: Uint8Array): Promise<vo
 }
 
 async function downloadBinary(url: string, dest: string): Promise<void> {
-  const res = await fetch(url, { headers: { "User-Agent": "falcio-updater" } });
+  const res = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
   if (!res.ok || !res.body) throw new Error(`Download failed: ${res.statusText}`);
 
   const total = Number(res.headers.get("content-length") || 0);
@@ -206,8 +285,8 @@ export async function runUpdate(args: string[]): Promise<number> {
   console.error(`Current version: ${currentVersion}`);
   console.error("Checking for updates...");
 
-  const release = await fetchLatestRelease();
-  const latestVersion = release.tag_name.replace(/^v/, "");
+  const release = await resolveLatestRelease();
+  const latestVersion = release.tag.replace(/^v/, "");
   const comparison = compareVersions(currentVersion, latestVersion);
 
   if (comparison === 0 && !force) {
@@ -228,12 +307,8 @@ export async function runUpdate(args: string[]): Promise<number> {
     return 1;
   }
 
-  const asset = release.assets.find((a) => a.name === assetName);
-  if (!asset) {
-    console.error(`No binary found for ${platform}.`);
-    console.error(`Available assets: ${release.assets.map((a) => a.name).join(", ")}`);
-    return 1;
-  }
+  const downloadUrl = await resolveDownloadUrl(release, assetName, platform);
+  if (!downloadUrl) return 1;
 
   if (!yes) {
     const answer = (await prompt(`Update from ${currentVersion} to ${latestVersion}? [y/N] `)).trim().toLowerCase();
@@ -244,7 +319,7 @@ export async function runUpdate(args: string[]): Promise<number> {
   }
 
   try {
-    await updateBinary(asset.browser_download_url, process.execPath);
+    await updateBinary(downloadUrl, process.execPath);
     console.log(`Successfully updated to version ${latestVersion}`);
     return 0;
   } catch (error) {
