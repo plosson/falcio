@@ -10,6 +10,7 @@ export async function runWhoami(_args: string[]): Promise<number> {
   }
   const activeOrg = me.data.organizations.find((o) => o.id === session.organization_id);
   const expires = new Date(session.refresh_expires_at).toISOString();
+  console.log(`Profile:    ${session.profile}`);
   console.log(`User:       ${me.data.firstName} ${me.data.lastName} <${me.data.email}>`);
   console.log(`User id:    ${me.data.id}`);
   console.log(

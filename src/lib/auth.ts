@@ -1,5 +1,6 @@
 import { refresh, type RefreshResult } from "./api.ts";
-import { loadSession, saveSession, type Session } from "./store.ts";
+import { loadSession, saveAccount, type Session } from "./store.ts";
+import { resolveProfileName } from "./profile.ts";
 
 export class AuthError extends Error {
   constructor(message: string) {
@@ -31,13 +32,14 @@ function applyRefresh(session: Session, r: Extract<RefreshResult, { type: "succe
  * Throws AuthError if no session exists or refresh fails.
  */
 export async function ensureAccessToken(): Promise<{ session: Session; accessToken: string }> {
-  const session = await loadSession();
+  const name = await resolveProfileName();
+  const session = await loadSession(name);
   if (!session) {
-    throw new AuthError("Not logged in. Run `falcio login` first.");
+    throw new AuthError(`Profile "${name}" is incomplete. Run \`falcio login\` again.`);
   }
   if (Date.now() >= session.refresh_expires_at) {
     throw new AuthError(
-      "Refresh token expired. Run `falcio login` again.",
+      `Refresh token expired for profile "${name}". Run \`falcio login --profile ${name}\` again.`,
     );
   }
   if (cached && cached.expires_at - ACCESS_LEEWAY_MS > Date.now()) {
@@ -48,11 +50,16 @@ export async function ensureAccessToken(): Promise<{ session: Session; accessTok
   if (r.type !== "success") {
     throw new AuthError(
       `Refresh failed (HTTP ${r.status}): ${r.details ?? "unknown error"}. ` +
-        `Try \`falcio login\` again.`,
+        `Try \`falcio login --profile ${name}\` again.`,
     );
   }
   const next = applyRefresh(session, r);
-  await saveSession(next);
+  // Credentials live on the account, shared with any sibling profile.
+  await saveAccount({
+    refresh_token: next.refresh_token,
+    refresh_expires_at: next.refresh_expires_at,
+    user: next.user,
+  });
   cached = { token: r.access_token, expires_at: Date.now() + r.expires_in * 1000 };
   return { session: next, accessToken: r.access_token };
 }
