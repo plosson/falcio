@@ -1,5 +1,7 @@
 # falcio
 
+> **Note:** falcio is now integrated into [agentio](https://github.com/plosson/agentio). No further updates will be made to this repo.
+
 CLI for your Falco account — sync received peppol invoices, issued sales invoices and payment status from the terminal.
 
 ## Install
